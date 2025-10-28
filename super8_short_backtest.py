@@ -73,6 +73,16 @@ class ShortParams:
     no_same_bar_exit: bool = True          # NU permite TP/SL în aceeași bară cu intrarea (ca în Pine)
 
 
+@dataclass
+class RiskSettings:
+    enabled: bool = False
+    base_pct: float = 0.01
+    min_pct: float = 0.0025
+    cap_pct: float = 0.073
+    cap_buffer_pct: float = 0.05
+    dd_stop_pct: float = 0.075
+    equity_start: float = 1.0
+
 
 @dataclass
 class Super8ShortBacktester:
@@ -80,6 +90,7 @@ class Super8ShortBacktester:
     short_params: ShortParams
     use_spread: bool = True
     log_return: bool = True
+    risk: Optional[RiskSettings] = None
 
     def run(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
@@ -243,27 +254,51 @@ class Super8ShortBacktester:
             DClower = pd.Series(np.nan, index=base.index)
 
         # 8) Bucla de backtest (single-position, next-bar entries & reverse-exits; TP/SL same-bar)
-        position = []
-        pos = 0
-        entry_price = np.nan
+        risk_cfg = self.risk or RiskSettings()
+        risk_enabled = bool(risk_cfg.enabled)
+        equity = float(risk_cfg.equity_start if risk_enabled else 1.0)
+        peak_equity = equity
+        entry_tol = 1e-9
+
+        positions = []
+        strategy_vals = []
+        trade_costs = []
+        weight_changes = []
+        equity_series = []
+        risk_records = []
+
+        prev_pos = 0.0
+        qty_open = 0.0
+        entry_price = float('nan')
+        sl_active = float('nan')
+
+        cap_eff = float(risk_cfg.cap_pct) * (1.0 - float(risk_cfg.cap_buffer_pct)) if risk_enabled else 0.0
+        start_time = self.short_params.start_time
 
         for t, row in base.iterrows():
-            # respect start_time
-            if self.short_params.start_time is not None and t < self.short_params.start_time:
-                position.append(0)
-                continue
+            price = float(row["Price"])
+            bar_return_raw = row.get("Return", 0.0)
+            spread_raw = row.get("Spread", 0.0)
+            bar_return = float(0.0 if pd.isna(bar_return_raw) else bar_return_raw)
+            spread = float(0.0 if pd.isna(spread_raw) else spread_raw)
 
-            price = row["Price"]
+            pos_weight = prev_pos
+            equity_start_bar = equity
+            drawdown_pct = ((peak_equity - equity_start_bar) / peak_equity) if peak_equity > 0 else 0.0
+            dd_blocked = risk_enabled and (drawdown_pct >= float(risk_cfg.dd_stop_pct))
 
-            # 2) aplică intrările semnalate pe bara anterioară (entry next-bar)
-            if pos == 0 and entry_sig.loc[t]:
-                pos = -1
-                entry_price = price  # intrare la close-ul barei curente
+            if risk_enabled and qty_open > 0 and equity_start_bar > 0 and not np.isnan(sl_active) and not np.isnan(entry_price):
+                dist_curr = max(0.0, sl_active - entry_price)
+                open_risk_before = (qty_open * dist_curr / equity_start_bar) if dist_curr > 0 else 0.0
+            else:
+                open_risk_before = 0.0
 
-            # 3) calculează niveluri TP/SL pentru starea curentă
-            avg_price = entry_price if (pos == -1 and not np.isnan(entry_price)) else price
+            allow_trading = (start_time is None) or (t >= start_time)
+            entry_signal = bool(entry_sig.loc[t])
+            exit_signal = bool(exit_sig.loc[t])
 
-            # --- TP (short) ---
+            avg_price = entry_price if (not np.isnan(entry_price) and abs(pos_weight) > entry_tol) else price
+
             if self.short_params.TP_options == "Both":
                 dc_val = DClower.loc[t] if 'DClower' in locals() and t in DClower.index else np.nan
                 tp_level = np.nanmin([dc_val if not np.isnan(dc_val) else np.inf,
@@ -276,7 +311,6 @@ class Super8ShortBacktester:
             else:
                 tp_level = np.nan
 
-            # --- SL (short) ATR stair-step ---
             atr_sl_val = atr_sl_short_series.loc[t] if t in atr_sl_short_series.index else np.nan
             if self.short_params.SL_options == "Both":
                 sl_level = max(atr_sl_val, (1.0 + self.short_params.sl/100.0) * avg_price)
@@ -286,52 +320,186 @@ class Super8ShortBacktester:
                 sl_level = atr_sl_val
             else:
                 sl_level = np.nan
-            
 
-            # 5) dacă suntem în poziție, evaluează ieșirile SAME-BAR (TP/SL și reverse-exit)
-            if pos == -1:
-                tp_hit = (not np.isnan(tp_level)) and (price <= tp_level)
-                sl_hit = (not np.isnan(sl_level)) and (price >= sl_level)
-                rev_hit = bool(self.short_params.reverse_exit and exit_sig.loc[t])
+            risk_info = {
+                "risk_equity_start": float(equity_start_bar),
+                "risk_peak_equity_before": float(peak_equity),
+                "risk_drawdown_pct": float(drawdown_pct),
+                "risk_dd_blocked": bool(dd_blocked),
+                "risk_open_risk_pct_before": float(open_risk_before),
+                "risk_entry_signal": bool(entry_signal),
+                "risk_exit_signal": bool(exit_signal),
+                "risk_allow_trading": bool(allow_trading),
+                "risk_cap_eff": float(cap_eff) if risk_enabled else np.nan,
+                "risk_r_base": float(risk_cfg.base_pct) if risk_enabled else np.nan,
+                "risk_r_min": float(risk_cfg.min_pct) if risk_enabled else np.nan,
+                "risk_r_new": np.nan,
+                "risk_entry_allowed": None,
+                "risk_entry_reason": "",
+                "risk_entry_qty": np.nan,
+                "risk_entry_weight": 0.0,
+                "risk_entry_dist": np.nan,
+                "risk_sl_level": float(sl_level) if not np.isnan(sl_level) else np.nan,
+                "risk_tp_level": float(tp_level) if not np.isnan(tp_level) else np.nan,
+                "risk_sl_active": float(sl_active) if not np.isnan(sl_active) else np.nan,
+                "risk_qty_open": float(qty_open) if risk_enabled else np.nan,
+                "risk_position_weight_prev": float(prev_pos),
+                "risk_tp_hit": False,
+                "risk_sl_hit": False,
+                "risk_reverse_exit": False,
+                "risk_exit_reason": "",
+            }
 
-                if tp_hit or sl_hit or rev_hit:
-                    # ieșim la finalul barei curente; P&L pe bară rămâne prins (position deja salvat)
-                    pos = 0
-                    entry_price = np.nan
+            executed_entry = False
+            reason = ""
+            if abs(pos_weight) <= entry_tol and entry_signal:
+                if not allow_trading:
+                    reason = "start_time"
+                elif dd_blocked:
+                    reason = "dd_block"
+                elif risk_enabled:
+                    if np.isnan(sl_level):
+                        reason = "missing_sl"
+                    else:
+                        dist = max(0.0, sl_level - price)
+                        if dist <= 0:
+                            reason = "invalid_sl"
+                        else:
+                            if open_risk_before >= cap_eff:
+                                reason = "cap_reached"
+                            else:
+                                r_avail = max(0.0, cap_eff - open_risk_before)
+                                r_new = min(float(risk_cfg.base_pct), r_avail)
+                                risk_info["risk_r_new"] = float(r_new)
+                                if r_new < float(risk_cfg.min_pct):
+                                    reason = "risk_min"
+                                else:
+                                    qty_new = (r_new * equity_start_bar) / dist if dist > 0 else 0.0
+                                    weight = (qty_new * price / equity_start_bar) if equity_start_bar > 0 else 0.0
+                                    if weight <= 0:
+                                        reason = "zero_weight"
+                                    else:
+                                        pos_weight = -float(weight)
+                                        qty_open = float(qty_new)
+                                        entry_price = price
+                                        sl_active = float(sl_level) if not np.isnan(sl_level) else float('nan')
+                                        executed_entry = True
+                                        risk_info["risk_entry_qty"] = float(qty_new)
+                                        risk_info["risk_entry_weight"] = float(weight)
+                                        risk_info["risk_entry_dist"] = float(dist)
+                                        risk_info["risk_entry_allowed"] = True
+                                        risk_info["risk_entry_reason"] = ""
+                else:
+                    pos_weight = -1.0
+                    qty_open = 1.0
+                    entry_price = price
+                    sl_active = float(sl_level) if not np.isnan(sl_level) else float('nan')
+                    executed_entry = True
+                    risk_info["risk_entry_allowed"] = True
+                    risk_info["risk_entry_weight"] = 1.0
+                    risk_info["risk_entry_dist"] = float(sl_level - price) if not np.isnan(sl_level) else np.nan
 
-            position.append(pos)
-            
-        positions = pd.Series(position, index=base.index, name="position")
+                if not executed_entry and reason:
+                    risk_info["risk_entry_allowed"] = False
+                    risk_info["risk_entry_reason"] = reason
 
-        # Backtest using returns + spread
+            if abs(pos_weight) > entry_tol and not np.isnan(sl_level):
+                if np.isnan(sl_active) or sl_level < sl_active:
+                    sl_active = float(sl_level)
+
+            tp_hit = (not np.isnan(tp_level)) and (price <= tp_level) and (abs(pos_weight) > entry_tol)
+            sl_hit = (not np.isnan(sl_level)) and (price >= sl_level) and (abs(pos_weight) > entry_tol)
+            rev_hit = bool(self.short_params.reverse_exit and exit_signal and (abs(pos_weight) > entry_tol))
+
+            if tp_hit or sl_hit or rev_hit:
+                if tp_hit:
+                    risk_info["risk_exit_reason"] = "tp"
+                elif sl_hit:
+                    risk_info["risk_exit_reason"] = "sl"
+                else:
+                    risk_info["risk_exit_reason"] = "reverse"
+                risk_info["risk_tp_hit"] = bool(tp_hit)
+                risk_info["risk_sl_hit"] = bool(sl_hit)
+                risk_info["risk_reverse_exit"] = bool(rev_hit)
+                pos_weight = 0.0
+                qty_open = 0.0
+                entry_price = float('nan')
+                sl_active = float('nan')
+
+            if abs(pos_weight) <= entry_tol:
+                qty_open = 0.0
+
+            if risk_enabled and qty_open > 0 and equity_start_bar > 0 and not np.isnan(sl_active) and not np.isnan(entry_price):
+                dist_after = max(0.0, sl_active - entry_price)
+                open_risk_after = (qty_open * dist_after / equity_start_bar) if dist_after > 0 else 0.0
+            else:
+                open_risk_after = 0.0
+
+            weight_change = abs(pos_weight - prev_pos)
+            trade_cost = weight_change * spread if self.use_spread else 0.0
+            strategy_ret = pos_weight * bar_return - trade_cost
+
+            if self.log_return:
+                equity = float(equity * np.exp(strategy_ret))
+            else:
+                equity = float(equity * (1.0 + strategy_ret))
+
+            peak_equity = max(peak_equity, equity)
+
+            risk_info.update({
+                "risk_open_risk_pct_after": float(open_risk_after),
+                "risk_sl_active": float(sl_active) if not np.isnan(sl_active) else np.nan,
+                "risk_qty_open": float(qty_open) if risk_enabled else np.nan,
+                "risk_position_weight": float(pos_weight),
+                "risk_entry_price": float(entry_price) if not np.isnan(entry_price) else np.nan,
+                "risk_strategy_return": float(strategy_ret),
+                "risk_trade_cost": float(trade_cost),
+                "risk_weight_change": float(weight_change),
+                "risk_equity_end": float(equity),
+                "risk_peak_equity_after": float(peak_equity),
+                "risk_drawdown_pct_after": float(((peak_equity - equity) / peak_equity) if peak_equity > 0 else 0.0),
+                "risk_equity_multiple": float(equity / (risk_cfg.equity_start if risk_enabled else 1.0)),
+            })
+
+            positions.append(float(pos_weight))
+            strategy_vals.append(float(strategy_ret))
+            trade_costs.append(float(trade_cost))
+            weight_changes.append(float(weight_change))
+            equity_series.append(float(equity))
+            risk_records.append(risk_info)
+
+            prev_pos = pos_weight
+
+        positions_series = pd.Series(positions, index=base.index, name="position")
+        strategy_series = pd.Series(strategy_vals, index=base.index, name="strategy")
+        trade_cost_series = pd.Series(trade_costs, index=base.index, name="trade_cost")
+        weight_change_series = pd.Series(weight_changes, index=base.index, name="weight_change")
+        equity_series = pd.Series(equity_series, index=base.index, name="equity_curve")
+        risk_df = pd.DataFrame(risk_records, index=base.index)
+
         bt = base.copy()
-
-        
-        bt["position"] = positions
-        bt["Return"]   = bt["Return"].fillna(0.0)
-        bt["Spread"]   = bt["Spread"].fillna(0.0)
-        bt["strategy"] = bt["position"] * bt["Return"]
-
         if bt.empty:
             raise ValueError("Backtest frame is empty (după join). Verifică datele/parametrii.")
 
-        # adu în bt flag-urile de debug (dacă există în base)
+        bt["position"] = positions_series
+        bt["Return"] = bt["Return"].fillna(0.0)
+        bt["Spread"] = bt["Spread"].fillna(0.0)
+        bt["strategy"] = strategy_series
+        bt["trade_cost"] = trade_cost_series
+        bt["weight_change"] = weight_change_series
+        bt["equity_curve"] = equity_series
+        bt = bt.join(risk_df)
+
         for col in ("DBG_reverse_trig", "DBG_longCond_raw", "DBG_BB_long01", "DBG_ATR_SL_Short",
                     "DBG_exit_cond", "DBG_EMA_longCond", "DBG_SAR_longCond", "DBG_MACD_longCond"):
             if col in base.columns:
                 bt[col] = base[col]
 
-        # trades: 1 la schimbare de poziție; primul bar e trade dacă intri direct în -1
-        pos_series = bt["position"].astype(int)
-        changes = pos_series.ne(pos_series.shift(1)).astype(int)
-        changes.iloc[0] = int(pos_series.iloc[0] != 0)
+        changes = (weight_change_series > entry_tol).astype(int)
+        if not changes.empty:
+            changes.iloc[0] = int(abs(positions_series.iloc[0]) > entry_tol)
         bt["trades"] = changes
 
-        # cost de spread (dacă e cazul)
-        if self.use_spread:
-            bt["strategy"] = bt["strategy"] - bt["trades"] * bt["Spread"]
-
-        # cumul
         if self.log_return:
             bt["creturn"]   = bt["Return"].cumsum().apply(np.exp)
             bt["cstrategy"] = bt["strategy"].cumsum().apply(np.exp)
@@ -341,7 +509,7 @@ class Super8ShortBacktester:
 
         _dbg(
             f"[BT] summary → rows={len(bt)}, trades={int(bt['trades'].sum())}, "
-            f"pos_rate={(bt['position'] == -1).mean():.3f}, "
+            f"pos_rate={(bt['position'].abs() > entry_tol).mean():.3f}, "
             f"perf={bt['cstrategy'].iloc[-1]:.4f}, bh={bt['creturn'].iloc[-1]:.4f}"
         )
 
