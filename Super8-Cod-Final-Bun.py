@@ -1298,6 +1298,9 @@ class Super8LiveRunner:
             return 0.0
         # Distanța în $ până la SL (pentru SHORT)
         tick = self.filters.get("tickSize", 0.0)
+        if tick <= 0:
+            self._err("tickSize invalid (<= 0); riscaj blocat pentru a păstra protecțiile.")
+            return 0.0
         sl_px = round_stop_for_short(sl_price_raw, tick)
         dist = max(0.0, sl_px - px_entry)
         if dist <= 0:
@@ -1456,7 +1459,7 @@ class Super8LiveRunner:
         if self.state.in_pos:
             new_sl = sig_now.get("atr_sl", float("nan"))
             new_tp = sig_now.get("tp_level", float("nan"))
-            tick = self.filters.get("tickSize, ", 0.0)
+            tick = self.filters.get("tickSize", 0.0)
             sl_px = round_stop_for_short(new_sl, tick) if not math.isnan(new_sl) else float("nan")
             tp_px = round_tp_for_short(new_tp, tick)   if not math.isnan(new_tp) else float("nan")
             # Histerezis: nu re-setăm dacă modificarea < 0.2%
