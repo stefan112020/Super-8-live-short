@@ -1,0 +1,5 @@
+Modificări efectuate:
+1. Am adăugat control explicit al modului de Stop Loss (Normal/ATR/Both) prin variabila globală SL_MODE, astfel încât optimizarea să includă doar parametrii relevanți și să transmită opțiunea către backtester.
+2. Am introdus funcții noi pentru calculul metricilor de performanță (P&L, drawdown, profit factor, win rate, durată maximă tranzacție) și afișarea lor într-un rezumat pentru fiecare simbol.
+3. Am extins rezultatele optimizării cu noile metrici și am adăugat o celulă dedicată pentru calcul și raportare a acestor indicatori după rulare.
+4. Am restrâns temporar optimizarea la parametrii de stop-loss (atrPeriodSl, multiplierPeriodSl, sl), cu limită fixă pentru sl între 2 și 7 pentru teste rapide.
