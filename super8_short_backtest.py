@@ -53,14 +53,14 @@ def _rma(series: pd.Series, period: int) -> pd.Series:
 
 @dataclass
 class ShortParams:
-    Position: str = "Both"
+    Position: str = "Short"
     TP_options: str = "Both"
     SL_options: str = "Both"
-    tp: float = 1.8
-    sl: float = 8.0
-    atrPeriodSl: int = 14
-    multiplierPeriodSl: float = 15.0
-    trailOffset: float = 0.0
+    tp: float = 3.6
+    sl: float = 5.0
+    atrPeriodSl: int = 116
+    multiplierPeriodSl: float = 107.0
+    trailOffset: float = 0.38
     reverse_exit: bool = True
     ignore_additional_entries: bool = True
     exit_on_entry_loss: bool = False
@@ -82,6 +82,94 @@ class RiskSettings:
     cap_buffer_pct: float = 0.05
     dd_stop_pct: float = 0.075
     equity_start: float = 1.0
+
+
+def _extract_trade_returns(bt: pd.DataFrame, log_returns: bool = True):
+    pos = bt.get("position", pd.Series(dtype=float)).fillna(0.0)
+    strat_ret = bt.get("strategy", pd.Series(dtype=float)).fillna(0.0)
+    trades = []
+    current = 0.0
+    in_trade = False
+    prev_pos = pos.shift(1).fillna(0.0)
+    for r, p, prev in zip(strat_ret, pos, prev_pos):
+        opened = (prev == 0) and (p != 0)
+        closed = (p == 0) and (prev != 0)
+        if opened:
+            current = 0.0
+            in_trade = True
+        if in_trade:
+            current += r
+        if in_trade and closed:
+            trades.append(current)
+            in_trade = False
+    return trades
+
+
+def compute_performance_metrics(bt: pd.DataFrame, initial_equity: float = 1.0, log_returns: bool = True) -> dict:
+    if bt is None or bt.empty:
+        return {
+            "total_pnl": 0.0,
+            "total_pnl_pct": 0.0,
+            "max_drawdown_pct": 0.0,
+            "profit_factor": 0.0,
+            "win_rate_pct": 0.0,
+            "total_trades": 0,
+            "max_trade_duration_days": 0.0,
+        }
+
+    equity_curve = bt.get("equity_curve")
+    if equity_curve is None or equity_curve.isna().all():
+        equity_curve = bt.get("cstrategy")
+    equity_curve = equity_curve.astype(float)
+    total_equity = float(equity_curve.iloc[-1])
+    total_pnl = total_equity - initial_equity
+    total_pnl_pct = (total_equity / initial_equity - 1.0) * 100
+
+    running_max = equity_curve.cummax()
+    dd = (running_max - equity_curve) / running_max.replace(0, np.nan)
+    max_dd_pct = float(dd.max() * 100) if len(dd) else 0.0
+
+    trade_logs = _extract_trade_returns(bt, log_returns=log_returns)
+    trade_pnls = [np.exp(x) - 1 if log_returns else x for x in trade_logs]
+    gross_profit = sum(v for v in trade_pnls if v > 0)
+    gross_loss = sum(v for v in trade_pnls if v < 0)
+    profit_factor = (gross_profit / abs(gross_loss)) if gross_loss < 0 else float("inf")
+
+    total_trades = len(trade_pnls)
+    wins = sum(1 for v in trade_pnls if v > 0)
+    win_rate_pct = (wins / total_trades * 100) if total_trades else 0.0
+
+    pos = bt.get("position", pd.Series(dtype=float)).fillna(0.0)
+    idx = bt.index
+    durations = []
+    start_idx = None
+    for cur, prev, ts in zip(pos, pos.shift(1).fillna(0.0), idx):
+        if prev == 0 and cur != 0:
+            start_idx = ts
+        if prev != 0 and cur == 0 and start_idx is not None:
+            dur_days = (ts - start_idx).total_seconds() / 86400 if hasattr(ts, 'to_pydatetime') else 0.0
+            durations.append(dur_days)
+            start_idx = None
+    max_dur = max(durations) if durations else 0.0
+
+    return {
+        "total_pnl": total_pnl,
+        "total_pnl_pct": total_pnl_pct,
+        "max_drawdown_pct": max_dd_pct,
+        "profit_factor": profit_factor,
+        "win_rate_pct": win_rate_pct,
+        "total_trades": total_trades,
+        "max_trade_duration_days": max_dur,
+    }
+
+
+def print_performance_summary(symbol: str, metrics: dict):
+    print(f"Rezumat performanță pentru {symbol}:")
+    print(f"  Total P&L: {metrics['total_pnl']:.2f} ({metrics['total_pnl_pct']:.2f}%)")
+    print(f"  Max drawdown: {metrics['max_drawdown_pct']:.2f}%")
+    print(f"  Profit factor: {metrics['profit_factor']:.2f}")
+    print(f"  Win rate: {metrics['win_rate_pct']:.2f}% din {metrics['total_trades']} tranzacții")
+    print(f"  Durată maximă tranzacție: {metrics['max_trade_duration_days']:.2f} zile")
 
 
 @dataclass
