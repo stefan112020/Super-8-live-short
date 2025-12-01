@@ -401,7 +401,8 @@ class Super8ShortBacktester:
 
             atr_sl_val = atr_sl_short_series.loc[t] if t in atr_sl_short_series.index else np.nan
             if self.short_params.SL_options == "Both":
-                sl_level = max(atr_sl_val, (1.0 + self.short_params.sl/100.0) * avg_price)
+                # În Pine, când avem atât ATR cât și SL procentual, se folosește nivelul MAI APROPIAT (minim pentru short)
+                sl_level = min(atr_sl_val, (1.0 + self.short_params.sl/100.0) * avg_price)
             elif self.short_params.SL_options == "Normal":
                 sl_level = (1.0 + self.short_params.sl/100.0) * avg_price
             elif self.short_params.SL_options == "ATR":
