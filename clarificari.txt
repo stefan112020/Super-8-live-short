@@ -1,0 +1,3 @@
+Clarificari despre strategii:
+- Strategia 1 este implementata in notebook-ul "Versiune 2.ipynb" si foloseste functia `optimal_strategy` drept obiectiv pentru optimizare.
+- Strategia 2 este compusa din notebook-ul "Super 8 parametri - 1.ipynb" impreuna cu modulele `super8_indicators.py` si `super8_short_backtest.py`.
