@@ -1,2 +1,0 @@
-Modificări efectuate în Versiune 2.ipynb:
-1. În funcția optimal_strategy am schimbat tratamentul erorilor pentru a nu recompensa eșecurile: acum se afișează eroarea și se returnează o valoare mare (1e6) astfel încât optimizatorul să ignore combinațiile care generează excepții.
