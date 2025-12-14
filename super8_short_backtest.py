@@ -2,7 +2,72 @@ import numpy as np
 import pandas as pd
 from dataclasses import dataclass
 from typing import Dict, Any, Optional
+
 from super8_indicators import Super8Indicators
+
+USE_BNB_FEES = True  # True: 0.036% taker; False: 0.04% taker
+
+
+def _ensure_price(df: pd.DataFrame) -> pd.DataFrame:
+    if "Price" not in df.columns:
+        if "close" in df.columns:
+            df["Price"] = df["close"]
+        else:
+            raise ValueError("Missing 'Price' or 'close'.")
+    for col in ("high", "low", "volume"):
+        if col not in df.columns:
+            raise ValueError(f"Missing '{col}' column.")
+    return df
+
+
+def _k_from_barlen(bar_length: str) -> float:
+    bl = (bar_length or "").upper()
+    if bl in ("M1", "1M"):
+        return 0.08
+    if bl in ("M5", "5M"):
+        return 0.12
+    if bl in ("M15", "15M"):
+        return 0.18
+    if bl in ("M30", "30M"):
+        return 0.20
+    if bl in ("H1", "1H"):
+        return 0.22
+    if bl in ("H2", "2H"):
+        return 0.26
+    if bl in ("H4", "4H"):
+        return 0.30
+    if bl in ("H6", "6H"):
+        return 0.32
+    if bl in ("H12", "12H"):
+        return 0.35
+    if bl in ("D1", "1D"):
+        return 0.40
+    return 0.26
+
+
+def compute_spread(
+    df: pd.DataFrame,
+    pay_fees_with_bnb: bool = USE_BNB_FEES,
+    bar_length: str = "H2",
+    slip_floor: float = 0.00005,
+    slip_cap: float = 0.0040,
+) -> float:
+    """
+    Spread per-side în log-return.
+    fee_pct: Binance Futures taker 0.04% (sau 0.036% cu BNB)
+    slip_pct: k * median((high-low)/Price) cu clip [slip_floor, slip_cap]
+    """
+    df = _ensure_price(df)
+
+    fee_pct = 0.00036 if pay_fees_with_bnb else 0.0004
+
+    rng = (df["high"] - df["low"]) / df["Price"]
+    k = _k_from_barlen(bar_length)
+    slip_pct = float(np.clip(k * float(np.nanmedian(rng)), slip_floor, slip_cap))
+
+    spread_log = float(-np.log(1.0 - (fee_pct + slip_pct)))
+    df["Spread"] = spread_log
+    return spread_log
 
 # === DEBUG switch ===
 DEBUG = True
@@ -11,20 +76,24 @@ def _dbg(msg: str = ""):
         print(msg)
 
 
-def _ensure_features(df: pd.DataFrame) -> pd.DataFrame:
-    # Ensure essential columns
-    if "Price" not in df.columns:
-        if "close" in df.columns:
-            df["Price"] = df["close"]
-        else:
-            raise ValueError("Missing 'Price' or 'close'.")
-    for c in ["high", "low", "volume"]:
-        if c not in df.columns:
-            raise ValueError(f"Missing '{c}' column.")
+def _ensure_features(
+    df: pd.DataFrame,
+    pay_fees_with_bnb: bool = USE_BNB_FEES,
+    bar_length: str = "H2",
+    slip_floor: float = 0.00005,
+    slip_cap: float = 0.0040,
+) -> pd.DataFrame:
+    df = _ensure_price(df)
     if "Return" not in df.columns:
         df["Return"] = np.log(df["Price"] / df["Price"].shift(1))
     if "Spread" not in df.columns:
-        df["Spread"] = (df["high"] - df["low"]) / df["Price"]
+        compute_spread(
+            df,
+            pay_fees_with_bnb=pay_fees_with_bnb,
+            bar_length=bar_length,
+            slip_floor=slip_floor,
+            slip_cap=slip_cap,
+        )
     return df
 
 
@@ -58,8 +127,8 @@ class ShortParams:
     SL_options: str = "Both"
     tp: float = 3.6
     sl: float = 5.0
-    atrPeriodSl: int = 116
-    multiplierPeriodSl: float = 107.0
+    atrPeriodSl: int = 21
+    multiplierPeriodSl: float = 9.5
     trailOffset: float = 0.38
     reverse_exit: bool = True
     ignore_additional_entries: bool = True
@@ -179,13 +248,23 @@ class Super8ShortBacktester:
     use_spread: bool = True
     log_return: bool = True
     risk: Optional[RiskSettings] = None
+    pay_fees_with_bnb: bool = USE_BNB_FEES
+    bar_length: str = "H2"
+    slip_floor: float = 0.00005
+    slip_cap: float = 0.0040
 
     def run(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
         if "time" in df.columns:
             df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
             df = df.dropna(subset=["time"]).set_index("time").sort_index()
-        df = _ensure_features(df).dropna()
+        df = _ensure_features(
+            df,
+            pay_fees_with_bnb=self.pay_fees_with_bnb,
+            bar_length=self.bar_length,
+            slip_floor=self.slip_floor,
+            slip_cap=self.slip_cap,
+        ).dropna()
         _dbg(f"[BT] df rows={len(df)} | cols={list(df.columns)}")
         try:
             _dbg(f"[BT] time: {df.index.min()} → {df.index.max()} | dup_time={int(df.index.duplicated().sum())}")
