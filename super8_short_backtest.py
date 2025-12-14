@@ -206,14 +206,17 @@ def compute_performance_metrics(bt: pd.DataFrame, initial_equity: float = 1.0, l
     total_trades = len(trade_pnls)
     gross_profit = sum(v for v in trade_pnls if v > 0)
     gross_loss = sum(v for v in trade_pnls if v < 0)
-    if total_trades == 0:
-        profit_factor = 0.0
-    elif gross_loss < 0:
-        profit_factor = gross_profit / abs(gross_loss)
-    elif gross_profit > 0:
-        profit_factor = float("inf")
-    else:
-        profit_factor = 0.0
+
+    def _profit_factor(gp: float, gl: float, n_trades: int) -> float:
+        if n_trades == 0:
+            return 0.0
+        if gl < 0:
+            return gp / abs(gl)
+        if gp > 0:
+            return float("inf")
+        return 0.0
+
+    profit_factor = _profit_factor(gross_profit, gross_loss, total_trades)
 
     wins = sum(1 for v in trade_pnls if v > 0)
     win_rate_pct = (wins / total_trades * 100.0) if total_trades else 0.0
