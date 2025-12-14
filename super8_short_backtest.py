@@ -157,24 +157,36 @@ def _extract_trade_returns(bt: pd.DataFrame, log_returns: bool = True):
     pos = bt.get("position", pd.Series(dtype=float)).fillna(0.0)
     strat_ret = bt.get("strategy", pd.Series(dtype=float)).fillna(0.0)
     trades = []
-    current = 0.0
     in_trade = False
     prev_pos = pos.shift(1).fillna(0.0)
+    agg = 0.0 if log_returns else 1.0
+
     for r, p, prev in zip(strat_ret, pos, prev_pos):
         opened = (prev == 0) and (p != 0)
         closed = (p == 0) and (prev != 0)
+
         if opened:
-            current = 0.0
+            agg = 0.0 if log_returns else 1.0
             in_trade = True
+
         if in_trade:
-            current += r
+            if log_returns:
+                agg += r
+            else:
+                agg *= (1.0 + r)
+
         if in_trade and closed:
-            trades.append(current)
+            trades.append(agg if log_returns else agg - 1.0)
             in_trade = False
+
     return trades
 
 
-def compute_performance_metrics(bt: pd.DataFrame, initial_equity: float = 1.0, log_returns: bool = True) -> dict:
+def compute_performance_metrics(
+    bt: pd.DataFrame,
+    initial_equity: float = 1.0,
+    log_returns: bool = True,
+) -> dict:
     if bt is None or bt.empty:
         return {
             "total_pnl": 0.0,
@@ -192,7 +204,7 @@ def compute_performance_metrics(bt: pd.DataFrame, initial_equity: float = 1.0, l
     equity_curve = equity_curve.astype(float)
     total_equity = float(equity_curve.iloc[-1])
     total_pnl = total_equity - initial_equity
-    total_pnl_pct = (total_equity / initial_equity - 1.0) * 100
+    total_pnl_pct = (total_equity / initial_equity - 1.0) * 100.0
 
     running_max = equity_curve.cummax()
     dd = (running_max - equity_curve) / running_max.replace(0, np.nan)
@@ -453,6 +465,11 @@ class Super8ShortBacktester:
             spread_raw = row.get("Spread", 0.0)
             bar_return = float(0.0 if pd.isna(bar_return_raw) else bar_return_raw)
             spread = float(0.0 if pd.isna(spread_raw) else spread_raw)
+
+            # Dacă rulăm pe randamente aritmetice, convertim log-return la pct.
+            if not self.log_return:
+                bar_return = np.exp(bar_return) - 1.0
+                spread = np.exp(spread) - 1.0
 
             pos_weight = prev_pos
             equity_start_bar = equity
