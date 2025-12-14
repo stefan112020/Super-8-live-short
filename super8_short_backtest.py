@@ -130,14 +130,19 @@ def compute_performance_metrics(bt: pd.DataFrame, initial_equity: float = 1.0, l
     max_dd_pct = float(dd.max() * 100) if len(dd) else 0.0
 
     trade_logs = _extract_trade_returns(bt, log_returns=log_returns)
-    trade_pnls = [np.exp(x) - 1 if log_returns else x for x in trade_logs]
-    gross_profit = sum(v for v in trade_pnls if v > 0)
-    gross_loss = sum(v for v in trade_pnls if v < 0)
-    profit_factor = (gross_profit / abs(gross_loss)) if gross_loss < 0 else float("inf")
+    trade_pnls = [np.exp(x) - 1.0 for x in trade_logs] if log_returns else list(trade_logs)
 
     total_trades = len(trade_pnls)
+    gross_profit = sum(v for v in trade_pnls if v > 0)
+    gross_loss = sum(v for v in trade_pnls if v < 0)
+    profit_factor = (
+        gross_profit / abs(gross_loss)
+        if gross_loss < 0
+        else (float("inf") if total_trades else 0.0)
+    )
+
     wins = sum(1 for v in trade_pnls if v > 0)
-    win_rate_pct = (wins / total_trades * 100) if total_trades else 0.0
+    win_rate_pct = (wins / total_trades * 100.0) if total_trades else 0.0
 
     pos = bt.get("position", pd.Series(dtype=float)).fillna(0.0)
     idx = bt.index
