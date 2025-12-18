@@ -200,6 +200,13 @@ class Super8SignalEngine:
         self.sp = sh_p.copy()
         self.df = pd.DataFrame()   # istoricul OHLCV curent
         self.keep_bars = 700      # se va seta din Runner (din LiveConfig)
+        self._last_signal = {
+            "entry_short": False,
+            "exit_reverse": False,
+            "atr_sl": float("nan"),
+            "tp_level": float("nan"),
+        }
+        self._last_bar_end: Optional[int] = None
         # lookback minim necesar pentru primele semnale
         self.lookback = int(max(
             self.p["sEma_Length"], self.p["BB_Length"], self.p["DClength"],
@@ -306,7 +313,10 @@ class Super8SignalEngine:
         ]
         # Dacă nu avem încă suficiente bare pentru lookback, nu generăm semnal
         if need_warmup:
-            return {"entry_short": False, "exit_reverse": False, "atr_sl": float("nan"), "tp_level": float("nan")}
+            sig = {"entry_short": False, "exit_reverse": False, "atr_sl": float("nan"), "tp_level": float("nan")}
+            self._last_signal = sig
+            self._last_bar_end = bar.get("end")
+            return sig
         df = self.df.copy()
         ind = self._compute_indicators(df)
         b = ind.iloc[-1]   # indicatorii pe bara curent închisă
@@ -340,12 +350,19 @@ class Super8SignalEngine:
         # --- Pruning istoric (păstrăm doar `history_keep_bars` bare) ---
         if len(self.df) > int(getattr(self, "keep_bars", 700)):
             self.df = self.df.tail(int(getattr(self, "keep_bars", 700)))
-        return {
+        sig = {
             "entry_short": entry_short,
             "exit_reverse": exit_reverse,
             "atr_sl": atr_sl_raw,   # SL ATR brut (stair-step se aplică în Runner)
             "tp_level": tp_level
         }
+        self._last_signal = sig
+        self._last_bar_end = bar.get("end")
+        return sig
+
+    def get_last_signal(self) -> dict:
+        """Returnează ultimul semnal calculat pe bară închisă (fără recalcul intrabar)."""
+        return dict(self._last_signal)
 
 def make_sizing_fn(broker: BrokerAdapter):
     def sizing(px: float, sym_cfg: SymbolConfig, filters: Dict[str, Any]) -> float:
@@ -781,7 +798,8 @@ short_params = {
 # ---------- Runner (logica de execuție live, cu delay de 1 bară) ----------
 class Super8LiveRunner:
     def __init__(self, broker: BrokerAdapter, live_cfg: LiveConfig, sym_cfg: SymbolConfig,
-                 indicator_fn: Callable, signal_fn: Callable, sizing_fn: Optional[Callable] = None):
+                 indicator_fn: Callable, signal_fn: Callable, sizing_fn: Optional[Callable] = None,
+                 signal_engine: Optional[Super8SignalEngine] = None):
         self.broker = broker
         self.live_cfg = live_cfg
         self.sym_cfg = sym_cfg
@@ -791,6 +809,11 @@ class Super8LiveRunner:
         self.indicator_fn = indicator_fn  # funcție indicatori (df -> indic.)
         self.signal_fn = signal_fn        # funcție semnal (symbol, bar) -> dict
         self.sizing_fn = sizing_fn        # funcție opțională dimensionare
+        self.engine: Optional[Super8SignalEngine] = signal_engine
+        if self.engine is None:
+            bound_engine = getattr(signal_fn, "__self__", None)
+            if isinstance(bound_engine, Super8SignalEngine):
+                self.engine = bound_engine
         self.exit_pending = False         # dacă avem o ieșire în așteptare de executat
         self.dry_run = getattr(self.live_cfg, "dry_run", True)
         self.log = TradeLogger(getattr(self.live_cfg, "log_csv", None))
@@ -828,6 +851,14 @@ class Super8LiveRunner:
         # Formatăm prețul cu numărul de zecimale permis de tick size
         dec = self._tick_decimals()
         return f"{px:.{dec}f}"
+
+    def _cached_signal(self) -> Dict[str, Any]:
+        if self.engine is not None and hasattr(self.engine, "get_last_signal"):
+            try:
+                return self.engine.get_last_signal()
+            except Exception:
+                return {}
+        return {}
 
     def bootstrap(self):
         # Conectează adaptorul broker și aplică setările inițiale
@@ -1321,8 +1352,11 @@ class Super8LiveRunner:
                 self._last_live_amt = 0.0
                 self.exit_pending = False
             return
-        # Calculăm semnalul pe bara închisă
-        sig = self.signal_fn(symbol, bar)
+        # Calculăm semnalul pe bara închisă (memorăm în engine pentru intrabar)
+        if self.engine is not None:
+            sig = self.engine.on_bar_close(symbol, bar)
+        else:
+            sig = self.signal_fn(symbol, bar)
         # Log de heartbeat la închiderea barei
         bar_time = pd.to_datetime(bar["end"], unit="ms", utc=True)
         print(f"\n[BAR CLOSE] {symbol} {bar_time.strftime('%Y-%m-%d %H:%M')} | Close: {bar['close']:.4f}")
@@ -1427,8 +1461,8 @@ class Super8LiveRunner:
                     self._tp(symbol, side="BUY", qty=total_for_protection, tp_price=tp_px)
             with self._lock:
                 self.pending_entry = False  # resetăm flag-ul de intrare (o singură execuție)
-        # 2) Semnal de reverse intrabar: dacă suntem în poziție și apare semnal de ieșire contrară
-        sig_now = self.signal_fn(symbol, bar)
+        # 2) Semnal de reverse intrabar: folosim semnalul memorat pe bara precedentă (fără recalcul intrabar)
+        sig_now = self._cached_signal() if self.engine is not None else self.signal_fn(symbol, bar)
         with self._lock:
             in_pos = self.state.in_pos
         if in_pos and sig_now.get("exit_reverse", False):
@@ -1574,6 +1608,7 @@ runner = Super8LiveRunner(
     sym_cfg=SymbolConfig(symbol="AVAXUSDC", usd_fixed=5, pct_equity=None),
     indicator_fn=lambda df: None,  # (Poate fi înlocuit cu un indicator custom, dacă e cazul)
     signal_fn=lambda sym, bar: engine.on_bar_close(sym, bar),
+    signal_engine=engine,
     sizing_fn=make_sizing_fn(broker),
 )
 
@@ -1622,5 +1657,3 @@ except Exception:
 
 
 # %% cell 2
-
-
