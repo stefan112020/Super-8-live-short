@@ -775,13 +775,15 @@ ind_params = {
 short_params = {
     "TP_options": "Both", "SL_options": "Both",
     "tp": 3.6, "sl": 8.0, "atrPeriodSl": 100,
-    "multiplierPeriodSl": 95.77, "trailOffset": 0.38
+    "multiplierPeriodSl": 95.77, "trailOffset": 0.38,
+    "reverse_exit": True, "start_time": None
 }
 
 # ---------- Runner (logica de execuție live, cu delay de 1 bară) ----------
 class Super8LiveRunner:
     def __init__(self, broker: BrokerAdapter, live_cfg: LiveConfig, sym_cfg: SymbolConfig,
-                 indicator_fn: Callable, signal_fn: Callable, sizing_fn: Optional[Callable] = None):
+                 indicator_fn: Callable, signal_fn: Callable, sizing_fn: Optional[Callable] = None,
+                 short_params: Optional[Dict[str, Any]] = None):
         self.broker = broker
         self.live_cfg = live_cfg
         self.sym_cfg = sym_cfg
@@ -798,6 +800,9 @@ class Super8LiveRunner:
         self._next_bar_start = None
         self._pending_levels = {"sl": math.nan, "tp": math.nan}
         self._bar_updates = 0
+        self.short_params = short_params or {}
+        self.start_time = self._parse_start_time(self.short_params.get("start_time"))
+        self.reverse_exit = bool(self.short_params.get("reverse_exit", True))
         # -- Variabile pentru log OANDA-like --
         self._cum_pl = 0.0
         self._last_entry = {"qty": 0.0, "price": math.nan, "side": None}
@@ -828,6 +833,26 @@ class Super8LiveRunner:
         # Formatăm prețul cu numărul de zecimale permis de tick size
         dec = self._tick_decimals()
         return f"{px:.{dec}f}"
+
+    def _parse_start_time(self, value: Any) -> Optional[pd.Timestamp]:
+        if value is None:
+            return None
+        if isinstance(value, float) and math.isnan(value):
+            return None
+        if isinstance(value, str) and not value.strip():
+            return None
+        try:
+            ts = pd.to_datetime(value)
+        except Exception:
+            self._err(f"Nu am putut interpreta start_time: {value}")
+            return None
+        if pd.isna(ts):
+            return None
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
+        return ts
 
     def bootstrap(self):
         # Conectează adaptorul broker și aplică setările inițiale
@@ -1326,11 +1351,11 @@ class Super8LiveRunner:
         # Log de heartbeat la închiderea barei
         bar_time = pd.to_datetime(bar["end"], unit="ms", utc=True)
         print(f"\n[BAR CLOSE] {symbol} {bar_time.strftime('%Y-%m-%d %H:%M')} | Close: {bar['close']:.4f}")
-        if sig.get("entry_short", False) or (self.state.in_pos and sig.get("exit_reverse", False)):
+        if sig.get("entry_short", False) or (self.reverse_exit and self.state.in_pos and sig.get("exit_reverse", False)):
             print("="*80)
             if sig.get("entry_short"):
                 print(f"🔴 SHORT SIGNAL | SL: {sig.get('atr_sl'):.4f} | TP: {sig.get('tp_level'):.4f}")
-            if sig.get("exit_reverse"):
+            if self.reverse_exit and sig.get("exit_reverse"):
                 print(f"🔵 EXIT SIGNAL (reverse)")
             print("="*80)
         # Resetăm contorul de update-uri intrabar (pentru bara nouă)
@@ -1340,10 +1365,11 @@ class Super8LiveRunner:
         entry_signal = bool(sig.get("entry_short", False))
         allow_pyr = bool(getattr(self.live_cfg, "pyramiding_enabled", False))
         max_batches = max(1, int(getattr(self.live_cfg, "max_entry_batches", 1)))
+        start_time_ok = (self.start_time is None) or (bar_time >= self.start_time)
         with self._lock:
             already_in_pos = self.state.in_pos
             current_batches = self.state.entries if already_in_pos else 0
-        self.pending_entry = entry_signal and (
+        self.pending_entry = entry_signal and start_time_ok and (
             (not already_in_pos) or (allow_pyr and current_batches < max_batches)
         )
         self._pending_levels["sl"] = sig.get("atr_sl", float("nan"))
@@ -1431,7 +1457,7 @@ class Super8LiveRunner:
         sig_now = self.signal_fn(symbol, bar)
         with self._lock:
             in_pos = self.state.in_pos
-        if in_pos and sig_now.get("exit_reverse", False):
+        if in_pos and self.reverse_exit and sig_now.get("exit_reverse", False):
             self._dbg("reverse signal -> calling ensure_flat()")
             with self._lock:
                 self._exiting = True
@@ -1575,6 +1601,7 @@ runner = Super8LiveRunner(
     indicator_fn=lambda df: None,  # (Poate fi înlocuit cu un indicator custom, dacă e cazul)
     signal_fn=lambda sym, bar: engine.on_bar_close(sym, bar),
     sizing_fn=make_sizing_fn(broker),
+    short_params=engine.sp,
 )
 
 # Configurări de mediu și bootstrap runner
@@ -1622,5 +1649,3 @@ except Exception:
 
 
 # %% cell 2
-
-
