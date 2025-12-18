@@ -57,6 +57,7 @@ class PositionState:
     qty: float = 0.0
     entry_price: float = math.nan
     atr_stop: float = math.nan   # ultimul SL ATR calculat (stair-step)
+    tp_level: float = math.nan   # ultimul TP calculat pe baza intrării
     entries: int = 0             # număr de execuții de intrare în poziția curentă
     tp_order_id: Optional[str] = None
     sl_order_id: Optional[str] = None
@@ -344,7 +345,13 @@ class Super8SignalEngine:
             "entry_short": entry_short,
             "exit_reverse": exit_reverse,
             "atr_sl": atr_sl_raw,   # SL ATR brut (stair-step se aplică în Runner)
-            "tp_level": tp_level
+            "tp_level": tp_level,
+            # Extra metadata pentru ramificațiile TP/SL (identice cu backtest-ul)
+            "dc_low": float(DCl) if not np.isnan(DCl) else float("nan"),
+            "tp_pct": float(self.sp.get("tp", float("nan"))),
+            "sl_pct": float(self.sp.get("sl", float("nan"))),
+            "TP_options": str(self.sp.get("TP_options", "Both")),
+            "SL_options": str(self.sp.get("SL_options", "Both")),
         }
 
 def make_sizing_fn(broker: BrokerAdapter):
@@ -796,7 +803,8 @@ class Super8LiveRunner:
         self.log = TradeLogger(getattr(self.live_cfg, "log_csv", None))
         self.pending_entry = False
         self._next_bar_start = None
-        self._pending_levels = {"sl": math.nan, "tp": math.nan}
+        self._pending_sig: Dict[str, Any] = {}
+        self._active_levels: Dict[str, float] = {"sl": math.nan, "tp": math.nan}
         self._bar_updates = 0
         # -- Variabile pentru log OANDA-like --
         self._cum_pl = 0.0
@@ -869,6 +877,7 @@ class Super8LiveRunner:
             # folosim prețul de intrare din fișier dacă există, altfel pe cel de la bursă
             self.state.entry_price = float(st.get("entry_price", live_entry_price if live_entry_price > 0 else self.state.entry_price))
             self.state.atr_stop = float(st.get("atr_stop", self.state.atr_stop))
+            self.state.tp_level = float(st.get("tp_level", self.state.tp_level))
             self.state.entries = int(st.get("entries", max(1, self.state.entries or 0)))
             # setează _last_entry pentru calcul P&L la ieșire
             if self.state.entry_price and not math.isnan(self.state.entry_price):
@@ -1198,6 +1207,7 @@ class Super8LiveRunner:
                 "qty": self.state.qty,
                 "entry_price": self.state.entry_price,
                 "atr_stop": self.state.atr_stop,
+                "tp_level": getattr(self.state, "tp_level", math.nan),
                 "entries": self.state.entries
             })
 
@@ -1313,6 +1323,49 @@ class Super8LiveRunner:
             return 0.0
         return float(qty)
 
+    def _calc_tp_sl_levels(self, entry_price: float, sig: Dict[str, Any]) -> Dict[str, float]:
+        """
+        Calculează nivelurile TP/SL pe baza prețului de intrare efectiv și a opțiunilor TP/SL,
+        replicând ramificațiile din backtest.
+        """
+        if entry_price is None or math.isnan(entry_price) or entry_price <= 0:
+            return {"tp": float("nan"), "sl": float("nan")}
+        tp_opt = str(sig.get("TP_options", "Both"))
+        sl_opt = str(sig.get("SL_options", "Both"))
+        tp_pct = float(sig.get("tp_pct", float("nan")))
+        sl_pct = float(sig.get("sl_pct", float("nan")))
+        dc_low = float(sig.get("dc_low", float("nan")))
+        atr_sl_val = float(sig.get("atr_sl", float("nan")))
+
+        tp_level = float("nan")
+        sl_level = float("nan")
+
+        if tp_opt == "Both":
+            tp_candidates = []
+            if not math.isnan(dc_low):
+                tp_candidates.append(dc_low)
+            if not math.isnan(tp_pct):
+                tp_candidates.append(entry_price * (1.0 - tp_pct / 100.0))
+            tp_level = min(tp_candidates) if tp_candidates else float("nan")
+        elif tp_opt == "Normal":
+            tp_level = entry_price * (1.0 - tp_pct / 100.0) if not math.isnan(tp_pct) else float("nan")
+        elif tp_opt == "Donchian":
+            tp_level = dc_low if not math.isnan(dc_low) else entry_price
+
+        if sl_opt == "Both":
+            sl_candidates = []
+            if not math.isnan(atr_sl_val):
+                sl_candidates.append(atr_sl_val)
+            if not math.isnan(sl_pct):
+                sl_candidates.append(entry_price * (1.0 + sl_pct / 100.0))
+            sl_level = min(sl_candidates) if sl_candidates else float("nan")
+        elif sl_opt == "Normal":
+            sl_level = entry_price * (1.0 + sl_pct / 100.0) if not math.isnan(sl_pct) else float("nan")
+        elif sl_opt == "ATR":
+            sl_level = atr_sl_val
+
+        return {"tp": tp_level, "sl": sl_level}
+
     def on_bar_close(self, symbol: str, bar: Dict[str, Any]):
         # Dacă aveam o ieșire în așteptare (exit_pending), încercăm din nou să închidem și ieșim
         if self.exit_pending:
@@ -1343,18 +1396,20 @@ class Super8LiveRunner:
         with self._lock:
             already_in_pos = self.state.in_pos
             current_batches = self.state.entries if already_in_pos else 0
+            if already_in_pos:
+                self._active_levels = self._calc_tp_sl_levels(self.state.entry_price, sig)
         self.pending_entry = entry_signal and (
             (not already_in_pos) or (allow_pyr and current_batches < max_batches)
         )
-        self._pending_levels["sl"] = sig.get("atr_sl", float("nan"))
-        self._pending_levels["tp"] = sig.get("tp_level", float("nan"))
+        self._pending_sig = dict(sig)
         self._next_bar_start = bar["end"]  # startul următoarei bare = end-ul barei curente
         # Re-aranjăm protecțiile (SL) dacă suntem în poziție și lipsesc, pentru siguranță
-        self.verify_protections(
-            symbol,
-            want_sl=sig.get("atr_sl", float("nan")),
-            want_tp=sig.get("tp_level", float("nan")),
-        )
+        if already_in_pos:
+            self.verify_protections(
+                symbol,
+                want_sl=self._active_levels.get("sl", float("nan")),
+                want_tp=self._active_levels.get("tp", float("nan")),
+            )
         
     def on_bar_update(self, symbol: str, bar: Dict[str, Any]):
         # Este apelat la fiecare update tick al barei curente (parțial)
@@ -1365,11 +1420,12 @@ class Super8LiveRunner:
                 and (self._next_bar_start is not None)
                 and (bar["start"] >= self._next_bar_start)
             )
-            pending_levels = dict(self._pending_levels)
+            pending_sig = dict(self._pending_sig)
         print(self._bar_updates, end="\r", flush=True)
         # 1) Execută intrarea dacă avem semnal pending (la deschiderea barei curente)
         if ready_to_enter:
             px_open = float(bar["open"])
+            levels_for_entry = self._calc_tp_sl_levels(px_open, pending_sig)
             with self._lock:
                 prev_qty = self.state.qty if self.state.in_pos else 0.0
                 prev_price = self.state.entry_price
@@ -1388,7 +1444,7 @@ class Super8LiveRunner:
                     with self._lock:
                         self.pending_entry = False
                     return
-                proposed_sl = pending_levels["sl"]
+                proposed_sl = levels_for_entry.get("sl", float("nan"))
                 risk_qty = self._risk_size(px_open, proposed_sl)
                 if risk_qty <= 0:
                     print("**Skipping entry (risk sizing returned 0)**")
@@ -1414,16 +1470,22 @@ class Super8LiveRunner:
                     self.state.entry_price = avg_price
                     self.state.entries = (prev_entries + 1) if prev_entries else 1
                     self._last_entry = {"qty": total_qty, "price": avg_price, "side": "SHORT"}
+                    # recalculăm TP/SL pe baza prețului de intrare efectiv (media după pyramiding)
+                    levels_for_entry = self._calc_tp_sl_levels(self.state.entry_price, pending_sig)
+                    self._active_levels = levels_for_entry
                 self._report_trade_oanda("GOING SHORT", units=-qty, price=px_open, pl=0.0)
                 # Plasăm imediat SL și TP server-side după intrare (folosind Mark Price)
                 total_for_protection = (prev_qty + qty)
-                if not math.isnan(pending_levels["sl"]):
-                    sl_px = round_stop_for_short(pending_levels["sl"], self.filters.get("tickSize", 0.0))
+                if not math.isnan(levels_for_entry.get("sl", float("nan"))):
+                    sl_px = round_stop_for_short(levels_for_entry["sl"], self.filters.get("tickSize", 0.0))
                     with self._lock:
                         self.state.atr_stop = sl_px
+                        self.state.tp_level = float(levels_for_entry.get("tp", math.nan))
                     self._sl(symbol, side="BUY", qty=total_for_protection, stop_price=sl_px)
-                if not math.isnan(pending_levels["tp"]):
-                    tp_px = round_tp_for_short(pending_levels["tp"], self.filters.get("tickSize", 0.0))
+                if not math.isnan(levels_for_entry.get("tp", float("nan"))):
+                    tp_px = round_tp_for_short(levels_for_entry["tp"], self.filters.get("tickSize", 0.0))
+                    with self._lock:
+                        self.state.tp_level = tp_px
                     self._tp(symbol, side="BUY", qty=total_for_protection, tp_price=tp_px)
             with self._lock:
                 self.pending_entry = False  # resetăm flag-ul de intrare (o singură execuție)
@@ -1454,11 +1516,11 @@ class Super8LiveRunner:
             return
         # 3) Ajustare dinamică SL/TP intrabar (trailing) – doar dacă avem poziție deschisă
         if self.state.in_pos:
-            new_sl = sig_now.get("atr_sl", float("nan"))
-            new_tp = sig_now.get("tp_level", float("nan"))
-            tick = self.filters.get("tickSize, ", 0.0)
-            sl_px = round_stop_for_short(new_sl, tick) if not math.isnan(new_sl) else float("nan")
-            tp_px = round_tp_for_short(new_tp, tick)   if not math.isnan(new_tp) else float("nan")
+            desired_levels = self._calc_tp_sl_levels(self.state.entry_price, sig_now)
+            self._active_levels = desired_levels
+            tick = self.filters.get("tickSize", 0.0)
+            sl_px = round_stop_for_short(desired_levels.get("sl", float("nan")), tick) if not math.isnan(desired_levels.get("sl", float("nan"))) else float("nan")
+            tp_px = round_tp_for_short(desired_levels.get("tp", float("nan")), tick)   if not math.isnan(desired_levels.get("tp", float("nan"))) else float("nan")
             # Histerezis: nu re-setăm dacă modificarea < 0.2%
             def moved(a, b, thr=0.002):
                 return (not math.isnan(a)) and (not math.isnan(b)) and (abs(a - b) / max(b, 1e-12) > thr)
@@ -1481,12 +1543,13 @@ class Super8LiveRunner:
                             self.state.atr_stop = sl_px
                             self._sl(symbol, side="BUY", qty=self.state.qty, stop_price=sl_px)
                     if not math.isnan(tp_px):
+                        self.state.tp_level = tp_px
                         self._tp(symbol, side="BUY", qty=self.state.qty, tp_price=tp_px)
         # 4) Asigurare: protecții la loc (re-armare dacă lipsesc)
         self.verify_protections(
             symbol,
-            want_sl=sig_now.get("atr_sl", float("nan")),
-            want_tp=sig_now.get("tp_level", float("nan")),
+            want_sl=self._active_levels.get("sl", float("nan")),
+            want_tp=self._active_levels.get("tp", float("nan")),
         )
         # 5) Verificare ușoară: dacă un SL/TP a închis poziția (în fundal), logăm ieșirea
         if self.state.in_pos and (self._bar_updates % 12 == 0):
@@ -1622,5 +1685,3 @@ except Exception:
 
 
 # %% cell 2
-
-
